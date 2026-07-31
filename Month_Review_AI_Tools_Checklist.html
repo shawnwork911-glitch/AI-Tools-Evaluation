@@ -208,10 +208,38 @@
     border: 1px solid var(--line); border-radius: 5px; padding: 6px 14px; cursor: pointer;
   }
   #save-btn:disabled { opacity: .6; cursor: default; }
+  #submit-btn { background: var(--gold); }
+  #submit-btn:disabled { opacity: .6; cursor: default; }
+  #readonly-banner.locked { border-left-color: var(--gold); background: #f7f1e4; color: #5c4a1f; }
 
   #admin-controls { align-items: center; gap: 8px; }
   #admin-controls label { color: var(--sub); }
   #admin-user-select { width: auto; min-width: 220px; }
+
+  #manage-overlay {
+    display: none; position: fixed; inset: 0; background: rgba(28,26,23,0.55);
+    align-items: center; justify-content: center; z-index: 210;
+  }
+  #manage-card {
+    background: var(--paper); border-radius: 8px; padding: 22px 26px; width: 92%; max-width: 640px;
+    max-height: 78vh; overflow-y: auto; font-family: "Helvetica Neue", Arial, sans-serif;
+  }
+  #manage-card-head { display: flex; justify-content: space-between; align-items: center; margin-bottom: 6px; }
+  #manage-card-head h2 { margin: 0; font-size: 17px; }
+  #manage-hint { font-size: 12.5px; color: var(--sub); margin: 0 0 16px; }
+  #manage-close-btn {
+    font-family: inherit; font-size: 12.5px; background: transparent; color: var(--sub);
+    border: 1px solid var(--line); border-radius: 5px; padding: 6px 14px; cursor: pointer;
+  }
+  table#manage-table { width: 100%; border-collapse: collapse; font-size: 13px; }
+  table#manage-table th { text-align: left; padding: 8px 6px; border-bottom: 2px solid var(--ink); font-size: 11.5px; text-transform: uppercase; letter-spacing: .03em; color: var(--sub); }
+  table#manage-table td { padding: 8px 6px; border-bottom: 1px solid var(--line); vertical-align: middle; }
+  .manage-view-btn, .manage-delete-btn {
+    font-family: inherit; font-size: 12px; border-radius: 5px; padding: 4px 10px; cursor: pointer; background: var(--paper);
+  }
+  .manage-view-btn { border: 1px solid var(--line); color: var(--ink); }
+  .manage-reopen-btn { border: 1px solid var(--gold); color: #7a5f22; margin-left: 6px; }
+  .manage-delete-btn { border: 1px solid #e2a49a; color: #8a2d1f; margin-left: 6px; }
 
   #readonly-banner {
     display: none; background: #eef2f7; border-left: 3px solid #4a6b8a;
@@ -219,10 +247,10 @@
     font-family: "Helvetica Neue", Arial, sans-serif; font-size: 13.5px; color: #2c3e50;
   }
 
-  body.readonly-view .dot-rating { cursor: default; }
-  body.readonly-view input:disabled,
-  body.readonly-view textarea:disabled,
-  body.readonly-view select:disabled { opacity: .75; cursor: default; }
+  .rating-locked .dot-rating { cursor: default; opacity: .65; }
+  .wrap input:disabled,
+  .wrap textarea:disabled,
+  .wrap select:disabled { opacity: .75; cursor: default; }
 
   @media print {
     #login-overlay, #user-bar { display: none !important; }
@@ -245,8 +273,25 @@
   <div id="admin-controls" style="display:none;">
     <label for="admin-user-select">Viewing:</label>
     <select id="admin-user-select" class="text-field"></select>
+    <button type="button" id="manage-users-btn" class="reset-btn" style="padding:6px 14px; font-size:12.5px;">Manage users</button>
   </div>
   <button type="button" id="signout-btn">Sign out</button>
+</div>
+
+<div id="manage-overlay">
+  <div id="manage-card">
+    <div id="manage-card-head">
+      <h2>Manage users</h2>
+      <button type="button" id="manage-close-btn">Close</button>
+    </div>
+    <p id="manage-hint">Everyone who has saved a checklist. View loads their form read-only; Reopen unlocks a submitted checklist so that person can edit and resubmit it; Delete permanently removes their saved entry.</p>
+    <table id="manage-table">
+      <thead>
+        <tr><th>Email</th><th>Claude Team</th><th>ChatGPT Team</th><th>Last saved</th><th></th></tr>
+      </thead>
+      <tbody id="manage-body"></tbody>
+    </table>
+  </div>
 </div>
 
 <div class="toolbar">
@@ -255,8 +300,10 @@
     <button class="team-btn gpt" id="btnGpt" onclick="selectTeam('chatgpt')">ChatGPT Team</button>
   </div>
   <div style="display:flex; gap:10px;">
+    <button class="reset-btn" id="preview-btn" onclick="previewMyForm()">Preview my saved form</button>
     <button class="reset-btn" id="reset-btn" onclick="resetAll()">Reset all entries</button>
-    <button class="pdf-btn" id="save-btn" onclick="saveDraft()">Save</button>
+    <button class="pdf-btn" id="save-btn" onclick="saveDraft()">Save draft</button>
+    <button class="pdf-btn" id="submit-btn" onclick="submitForReview()">Send for review</button>
   </div>
 </div>
 
@@ -391,23 +438,27 @@
   ];
 
   const weeksEl = document.getElementById('weeks');
-  const block = document.createElement('div');
-  block.className = 'week-block';
-  block.innerHTML = `<div class="week-head">This month <span class="tag">check in whenever it happens</span></div>`;
-  const ul = document.createElement('ul');
-  ul.className = 'checklist';
-  monthItems.forEach((text, ii) => {
-    const id = `m${ii}`;
-    const li = document.createElement('li');
-    li.innerHTML = `<input type="checkbox" id="${id}"><label for="${id}">${text}</label>`;
-    ul.appendChild(li);
-  });
-  const noteRow = document.createElement('div');
-  noteRow.className = 'note-row';
-  noteRow.innerHTML = `<div class="note-label">Win / frustration notes</div><textarea class="note" id="monthNote" placeholder="Jot things down as they happen..." style="min-height:90px;"></textarea>`;
-  block.appendChild(ul);
-  block.appendChild(noteRow);
-  weeksEl.appendChild(block);
+  function buildMonthBlock(teamKey, teamLabel, dotClass, onlyClass){
+    const block = document.createElement('div');
+    block.className = 'week-block ' + onlyClass;
+    block.innerHTML = `<div class="week-head"><span><span class="dot ${dotClass}" style="display:inline-block; margin-right:8px; vertical-align:middle;"></span>This month — ${teamLabel}</span><span class="tag">check in whenever it happens</span></div>`;
+    const ul = document.createElement('ul');
+    ul.className = 'checklist';
+    monthItems.forEach((text, ii) => {
+      const id = `m${teamKey}${ii}`;
+      const li = document.createElement('li');
+      li.innerHTML = `<input type="checkbox" id="${id}"><label for="${id}">${text}</label>`;
+      ul.appendChild(li);
+    });
+    const noteRow = document.createElement('div');
+    noteRow.className = 'note-row';
+    noteRow.innerHTML = `<div class="note-label">Win / frustration notes</div><textarea class="note" id="monthNote${teamKey}" placeholder="Jot things down as they happen..." style="min-height:90px;"></textarea>`;
+    block.appendChild(ul);
+    block.appendChild(noteRow);
+    return block;
+  }
+  weeksEl.appendChild(buildMonthBlock('C', 'Claude Team', 'claude', 'only-claude'));
+  weeksEl.appendChild(buildMonthBlock('G', 'ChatGPT Team', 'gpt', 'only-chatgpt'));
 
   const scoreBody = document.getElementById('scoreBody');
   categories.forEach((cat, i) => {
@@ -445,8 +496,14 @@
 
   let readOnlyMode = false; // true while an admin is viewing another user's submission
 
-  function setRating(team, index, value) {
-    if (readOnlyMode) return;
+  function setRating(team, index, value, force) {
+    if (!force) {
+      if (readOnlyMode) return;
+      if (typeof lockedTeams !== 'undefined') {
+        if (team === 'c' && lockedTeams.claude) return;
+        if (team === 'g' && lockedTeams.gpt) return;
+      }
+    }
     ratings[team][index] = value;
     const container = document.querySelector(`.rating[data-team="${team}"][data-index="${index}"]`);
     const dots = container.querySelectorAll('.dot-rating');
@@ -472,9 +529,11 @@
   }
 
   function selectTeam(team) {
-    document.body.className = team === 'claude' ? 'mode-claude' : 'mode-chatgpt';
+    document.body.classList.toggle('mode-claude', team === 'claude');
+    document.body.classList.toggle('mode-chatgpt', team === 'chatgpt');
     document.getElementById('btnClaude').classList.toggle('active', team === 'claude');
     document.getElementById('btnGpt').classList.toggle('active', team === 'chatgpt');
+    if(typeof updateSubmitButtonState === 'function') updateSubmitButtonState();
   }
 
   function clearFormFields() {
@@ -512,6 +571,13 @@ const SP_LIST_NAME = "AI Tools Evaluation Report";            // must match the 
 const GRAPH_SCOPES = ["Sites.ReadWrite.All", "User.Read"];
 const ADMIN_EMAIL = "shauyuan.tan@saxonrenewables.com";      // hardcoded admin — can view every user's saved form
 
+/* Two independent status columns so submitting one team's checklist
+   never locks the other team's. Add these as two new Single-line-text
+   columns on the SharePoint list (the old shared "Status" column is no
+   longer used and can be left as-is or removed). */
+const STATUS_CLAUDE_DISPLAY = 'Status (Claude Team)';
+const STATUS_GPT_DISPLAY = 'Status (ChatGPT Team)';
+
 function isAdmin(){
   return !!(currentAccount && currentAccount.username &&
     currentAccount.username.toLowerCase() === ADMIN_EMAIL.toLowerCase());
@@ -530,6 +596,7 @@ let currentAccount = null;
 let siteId = null;
 let listId = null;
 let myItemId = null;        // this user's existing SharePoint list item id, or null if no draft saved yet
+let lockedTeams = { claude: false, gpt: false }; // each team locks independently once that team's checklist is submitted
 let suppressAutosave = false;
 const msalReady = msalInstance.initialize();   // MSAL v3 requires this to complete before any other MSAL call
 
@@ -578,13 +645,6 @@ const SECTION_AGENT = 'Build One Simple Agent';
 const SECTION_SCORECARD = 'Scorecard — 100 Points Total';
 
 const FIELD_DEFS = [
-  { id:'m0', section:SECTION_CHECKLIST, kind:'checkbox' },
-  { id:'m1', section:SECTION_CHECKLIST, kind:'checkbox' },
-  { id:'m2', section:SECTION_CHECKLIST, kind:'checkbox' },
-  { id:'m3', section:SECTION_CHECKLIST, kind:'checkbox' },
-  { id:'m4', section:SECTION_CHECKLIST, kind:'checkbox' },
-  { id:'m5', section:SECTION_CHECKLIST, kind:'checkbox' },
-  { id:'monthNote', section:SECTION_CHECKLIST, kind:'text' },
   { id:'testGoal', section:SECTION_PROMPT, kind:'text' },
   { id:'testPrompt', section:SECTION_PROMPT, kind:'text' },
   { id:'claudeResponse', section:SECTION_PROMPT, kind:'text' },
@@ -602,6 +662,12 @@ const FIELD_DEFS = [
   { id:'agentBabyGpt', section:SECTION_AGENT, kind:'text' },
   { id:'agentBrokeGpt', section:SECTION_AGENT, kind:'text' }
 ];
+['C', 'G'].forEach(teamKey => {
+  monthItems.forEach((text, ii) => {
+    FIELD_DEFS.push({ id: 'm' + teamKey + ii, section: SECTION_CHECKLIST, kind: 'checkbox' });
+  });
+  FIELD_DEFS.push({ id: 'monthNote' + teamKey, section: SECTION_CHECKLIST, kind: 'text' });
+});
 const RATING_LABELS = [
   'Speed', 'Accuracy', 'Context Memory', 'Non Work Ease', 'Writing Help',
   'Research Help', 'Planning Help', 'Mobile Use', 'Value For Money', 'Overall Satisfaction'
@@ -611,6 +677,29 @@ RATING_LABELS.forEach((label, i) => {
   FIELD_DEFS.push({ section:SECTION_SCORECARD, kind:'rating', team:'g', index:i, key:'g_' + i + '_' + label });
 });
 const SECTIONS = [SECTION_CHECKLIST, SECTION_PROMPT, SECTION_AGENT, SECTION_SCORECARD];
+
+/* Which DOM fields belong to which team, so a submission can lock just
+   that team's inputs. Shared fields (testGoal, testPrompt) are never
+   locked — they're the "current test" scratch area for whichever team
+   you're actively reviewing. */
+const TEAM_FIELD_IDS = {
+  claude: [
+    'claudeResponse', 'claudeAchieved',
+    'agentTaskClaude', 'agentTimeClaude', 'agentSaveClaude', 'agentBabyClaude', 'agentBrokeClaude',
+    'monthNoteC',
+    ...monthItems.map((_, ii) => 'mC' + ii)
+  ],
+  gpt: [
+    'gptResponse', 'gptAchieved',
+    'agentTaskGpt', 'agentTimeGpt', 'agentSaveGpt', 'agentBabyGpt', 'agentBrokeGpt',
+    'monthNoteG',
+    ...monthItems.map((_, ii) => 'mG' + ii)
+  ]
+};
+function statusValue(existing, display){
+  const internal = columnMapCache && columnMapCache[display];
+  return internal ? existing.fields[internal] : undefined;
+}
 
 let columnMapCache = null;
 async function getColumnMap(){
@@ -633,7 +722,7 @@ function getFieldValue(def){
 function setFieldValue(def, value){
   if(def.kind === 'checkbox'){ const el = document.getElementById(def.id); if(el) el.checked = !!value; return; }
   if(def.kind === 'text'){ const el = document.getElementById(def.id); if(el) el.value = value || ''; return; }
-  if(def.kind === 'rating'){ const v = Number(value) || 0; if(v) setRating(def.team, def.index, v); return; }
+  if(def.kind === 'rating'){ const v = Number(value) || 0; if(v) setRating(def.team, def.index, v, true); return; }
 }
 function fieldDefKey(def){ return def.key || def.id; }
 
@@ -664,40 +753,116 @@ function applyItemToForm(existing){
 }
 function setFormInteractive(enabled){
   document.querySelectorAll('.wrap input, .wrap textarea, .wrap select').forEach(el => { el.disabled = !enabled; });
+  document.querySelectorAll('.rating').forEach(el => el.classList.toggle('rating-locked', !enabled));
   const saveBtn = document.getElementById('save-btn');
   const resetBtn = document.getElementById('reset-btn');
+  const previewBtn = document.getElementById('preview-btn');
+  const submitBtn = document.getElementById('submit-btn');
   if(saveBtn) saveBtn.style.display = enabled ? '' : 'none';
   if(resetBtn) resetBtn.style.display = enabled ? '' : 'none';
+  if(previewBtn) previewBtn.style.display = enabled ? '' : 'none';
+  if(submitBtn) submitBtn.style.display = enabled ? '' : 'none';
+}
+function setTeamInteractive(team, enabled){
+  const ids = TEAM_FIELD_IDS[team] || [];
+  ids.forEach(id => { const el = document.getElementById(id); if(el) el.disabled = !enabled; });
+  const ratingKey = team === 'gpt' ? 'g' : 'c';
+  document.querySelectorAll('.rating[data-team="' + ratingKey + '"]').forEach(el => el.classList.toggle('rating-locked', !enabled));
+}
+function currentTeamKey(){
+  return document.body.classList.contains('mode-chatgpt') ? 'gpt' : 'claude';
+}
+function updateSubmitButtonState(){
+  const submitBtn = document.getElementById('submit-btn');
+  if(!submitBtn) return;
+  const locked = lockedTeams[currentTeamKey()];
+  submitBtn.disabled = !!locked;
+  submitBtn.textContent = locked ? 'Already submitted' : 'Send for review';
+}
+function updateSaveResetVisibility(){
+  const bothLocked = lockedTeams.claude && lockedTeams.gpt;
+  const saveBtn = document.getElementById('save-btn');
+  const resetBtn = document.getElementById('reset-btn');
+  const submitBtn = document.getElementById('submit-btn');
+  if(saveBtn) saveBtn.style.display = bothLocked ? 'none' : '';
+  if(resetBtn) resetBtn.style.display = bothLocked ? 'none' : '';
+  if(submitBtn) submitBtn.style.display = bothLocked ? 'none' : '';
+}
+function updateReadonlyBannerForSelf(){
+  const banner = document.getElementById('readonly-banner');
+  if(lockedTeams.claude && lockedTeams.gpt){
+    document.body.classList.add('readonly-view');
+    showLockedBanner('You\u2019ve submitted both the Claude Team and ChatGPT Team checklists — this form is now fully locked and cannot be edited.');
+  }else if(lockedTeams.claude || lockedTeams.gpt){
+    document.body.classList.remove('readonly-view');
+    const doneTeam = lockedTeams.claude ? 'Claude Team' : 'ChatGPT Team';
+    const openTeam = lockedTeams.claude ? 'ChatGPT Team' : 'Claude Team';
+    banner.classList.remove('locked');
+    banner.textContent = 'Your ' + doneTeam + ' checklist has been submitted and is locked. Your ' + openTeam + ' checklist is still open — use the toggle above to switch teams and keep filling it in.';
+    banner.style.display = 'block';
+  }else{
+    document.body.classList.remove('readonly-view');
+    banner.style.display = 'none';
+  }
+  updateSubmitButtonState();
+  updateSaveResetVisibility();
+}
+function showLockedBanner(message){
+  const banner = document.getElementById('readonly-banner');
+  banner.classList.add('locked');
+  banner.textContent = message;
+  banner.style.display = 'block';
 }
 async function loadMyDraft(){
   const email = currentAccount.username;
   const existing = await findMyItem(email);
   if(!existing){
+    lockedTeams = { claude: false, gpt: false };
+    readOnlyMode = false;
+    document.body.classList.remove('readonly-view');
+    document.getElementById('readonly-banner').style.display = 'none';
+    setFormInteractive(true);
+    updateSubmitButtonState();
     document.getElementById('draft-status').textContent = ' · no draft yet';
     return;
   }
   myItemId = existing.id;
   await getColumnMap();
   applyItemToForm(existing);
-  document.getElementById('draft-status').textContent =
-    existing.fields.Status === 'Submitted' ? ' · submitted' : ' · draft loaded';
+  readOnlyMode = false;
+  lockedTeams.claude = statusValue(existing, STATUS_CLAUDE_DISPLAY) === 'Submitted';
+  lockedTeams.gpt = statusValue(existing, STATUS_GPT_DISPLAY) === 'Submitted';
+  setFormInteractive(true);
+  setTeamInteractive('claude', !lockedTeams.claude);
+  setTeamInteractive('gpt', !lockedTeams.gpt);
+  updateReadonlyBannerForSelf();
+  const statusParts = [];
+  if(lockedTeams.claude) statusParts.push('Claude Team submitted');
+  if(lockedTeams.gpt) statusParts.push('ChatGPT Team submitted');
+  document.getElementById('draft-status').textContent = statusParts.length ? ' · ' + statusParts.join(' · ') : ' · draft loaded';
 }
 
 /* ---- Admin: list every user's saved row, and load a chosen one read-only ---- */
 async function fetchAllItems(){
   const colMap = await getColumnMap();
   const emailCol = colMap['Email'];
-  const statusCol = colMap['Status'];
+  const claudeStatusCol = colMap[STATUS_CLAUDE_DISPLAY];
+  const gptStatusCol = colMap[STATUS_GPT_DISPLAY];
+  const savedCol = colMap['LastSavedDate'];
   const selectCols = ['Title'];
   if(emailCol) selectCols.push(emailCol);
-  if(statusCol) selectCols.push(statusCol);
+  if(claudeStatusCol) selectCols.push(claudeStatusCol);
+  if(gptStatusCol) selectCols.push(gptStatusCol);
+  if(savedCol) selectCols.push(savedCol);
   const data = await graphFetch(
     "/sites/" + siteId + "/lists/" + listId + "/items?$expand=fields($select=" + selectCols.join(',') + ")&$top=999"
   );
   return (data.value || []).map(item => ({
     id: item.id,
     email: (emailCol && item.fields[emailCol]) || item.fields.Title || '(unknown)',
-    status: statusCol ? item.fields[statusCol] : ''
+    claudeStatus: (claudeStatusCol && item.fields[claudeStatusCol]) || 'Draft',
+    gptStatus: (gptStatusCol && item.fields[gptStatusCol]) || 'Draft',
+    lastSaved: savedCol ? item.fields[savedCol] : ''
   }));
 }
 async function setupAdminControls(){
@@ -713,87 +878,260 @@ async function setupAdminControls(){
       .forEach(it => {
         const opt = document.createElement('option');
         opt.value = it.id;
-        opt.textContent = it.email + (it.status ? ' — ' + it.status : '');
+        opt.textContent = it.email + ' — Claude: ' + it.claudeStatus + ' · ChatGPT: ' + it.gptStatus;
         select.appendChild(opt);
       });
   }catch(err){
     console.error('Admin: failed to list saved submissions:', err);
   }
 }
+
+/* ---- Shared read-only banner with a "back to editing" action ---- */
+function showReadonlyBanner(message){
+  const banner = document.getElementById('readonly-banner');
+  banner.classList.remove('locked');
+  banner.innerHTML = message + ' <button type="button" id="back-to-edit-btn" class="reset-btn" style="padding:4px 10px; font-size:12px; margin-left:10px;">Back to editing</button>';
+  banner.style.display = 'block';
+  document.getElementById('back-to-edit-btn').addEventListener('click', goToMyForm);
+}
+async function goToMyForm(){
+  readOnlyMode = false;
+  lockedTeams = { claude: false, gpt: false };
+  document.body.classList.remove('readonly-view');
+  document.getElementById('readonly-banner').style.display = 'none';
+  const sel = document.getElementById('admin-user-select');
+  if(sel) sel.value = '__self__';
+  clearFormFields();
+  setFormInteractive(true);
+  myItemId = null;
+  await loadMyDraft();
+}
+async function loadOtherUserItem(itemId){
+  readOnlyMode = true;
+  lockedTeams = { claude: false, gpt: false }; // viewing someone else's data — not this account's own lock state
+  document.body.classList.add('readonly-view');
+  clearFormFields();
+  setFormInteractive(false);
+  showReadonlyBanner('Loading…');
+  try{
+    const existing = await graphFetch("/sites/" + siteId + "/lists/" + listId + "/items/" + itemId + "?expand=fields");
+    await getColumnMap();
+    applyItemToForm(existing);
+    const colMap = columnMapCache || {};
+    const emailCol = colMap['Email'];
+    const emailVal = (emailCol && existing.fields[emailCol]) || existing.fields.Title || 'this user';
+    const cSub = statusValue(existing, STATUS_CLAUDE_DISPLAY) === 'Submitted';
+    const gSub = statusValue(existing, STATUS_GPT_DISPLAY) === 'Submitted';
+    showReadonlyBanner('Viewing ' + emailVal + '\u2019s submission — read-only. (Claude Team: ' + (cSub ? 'submitted' : 'draft') + ' · ChatGPT Team: ' + (gSub ? 'submitted' : 'draft') + ')');
+  }catch(err){
+    showReadonlyBanner('Could not load that submission — ' + err.message);
+    console.error(err);
+  }
+}
 document.getElementById('admin-user-select').addEventListener('change', async (e) => {
   const val = e.target.value;
-  const banner = document.getElementById('readonly-banner');
   if(val === '__self__'){
-    readOnlyMode = false;
-    document.body.classList.remove('readonly-view');
-    banner.style.display = 'none';
-    clearFormFields();
-    setFormInteractive(true);
-    myItemId = null;
-    await loadMyDraft();
+    await goToMyForm();
     return;
   }
+  await loadOtherUserItem(val);
+});
+
+/* ---- Preview: any signed-in user can view their own last-saved (server) copy, read-only ---- */
+async function previewMyForm(){
+  showReadonlyBanner('Loading your saved submission…');
   readOnlyMode = true;
   document.body.classList.add('readonly-view');
   clearFormFields();
   setFormInteractive(false);
-  banner.textContent = 'Loading…';
-  banner.style.display = 'block';
   try{
-    const existing = await graphFetch("/sites/" + siteId + "/lists/" + listId + "/items/" + val + "?expand=fields");
+    const email = currentAccount.username;
+    const existing = await findMyItem(email);
+    if(!existing){
+      showReadonlyBanner('You haven\u2019t saved a form yet — nothing to preview.');
+      return;
+    }
+    await getColumnMap();
     applyItemToForm(existing);
-    const colMap = await getColumnMap();
-    const emailCol = colMap['Email'];
-    const emailVal = (emailCol && existing.fields[emailCol]) || existing.fields.Title || 'this user';
-    banner.textContent = 'Viewing ' + emailVal + '’s submission — read-only. Choose "My form" above to go back to editing your own.';
+    const cSub = statusValue(existing, STATUS_CLAUDE_DISPLAY) === 'Submitted';
+    const gSub = statusValue(existing, STATUS_GPT_DISPLAY) === 'Submitted';
+    showReadonlyBanner('Previewing your last saved submission (Claude Team: ' + (cSub ? 'submitted' : 'draft') + ' · ChatGPT Team: ' + (gSub ? 'submitted' : 'draft') + ') — read-only.');
   }catch(err){
-    banner.textContent = 'Could not load that submission — ' + err.message;
+    showReadonlyBanner('Could not load your saved submission — ' + err.message);
     console.error(err);
   }
+}
+
+/* ---- Admin: Manage users modal — view or permanently delete anyone's saved entry ---- */
+async function openManageUsers(){
+  const overlay = document.getElementById('manage-overlay');
+  const body = document.getElementById('manage-body');
+  overlay.style.display = 'flex';
+  body.innerHTML = '<tr><td colspan="5" style="color:var(--sub);">Loading…</td></tr>';
+  try{
+    const items = await fetchAllItems();
+    if(!items.length){
+      body.innerHTML = '<tr><td colspan="5" style="color:var(--sub);">No saved submissions yet.</td></tr>';
+      return;
+    }
+    body.innerHTML = '';
+    items.sort((a, b) => a.email.localeCompare(b.email)).forEach(it => {
+      const savedLabel = it.lastSaved ? new Date(it.lastSaved).toLocaleString() : '—';
+      const tr = document.createElement('tr');
+      const reopenBtns =
+        (it.claudeStatus === 'Submitted' ? '<button type="button" class="manage-reopen-btn" data-id="' + it.id + '" data-email="' + it.email + '" data-team="claude">Reopen Claude</button>' : '') +
+        (it.gptStatus === 'Submitted' ? '<button type="button" class="manage-reopen-btn" data-id="' + it.id + '" data-email="' + it.email + '" data-team="gpt">Reopen ChatGPT</button>' : '');
+      tr.innerHTML =
+        '<td>' + it.email + '</td>' +
+        '<td>' + it.claudeStatus + '</td>' +
+        '<td>' + it.gptStatus + '</td>' +
+        '<td>' + savedLabel + '</td>' +
+        '<td style="text-align:right; white-space:nowrap;">' +
+          '<button type="button" class="manage-view-btn" data-id="' + it.id + '">View</button>' +
+          reopenBtns +
+          '<button type="button" class="manage-delete-btn" data-id="' + it.id + '" data-email="' + it.email + '">Delete</button>' +
+        '</td>';
+      body.appendChild(tr);
+    });
+    body.querySelectorAll('.manage-view-btn').forEach(btn => {
+      btn.addEventListener('click', async () => {
+        overlay.style.display = 'none';
+        const select = document.getElementById('admin-user-select');
+        if(select) select.value = btn.dataset.id;
+        await loadOtherUserItem(btn.dataset.id);
+      });
+    });
+    body.querySelectorAll('.manage-reopen-btn').forEach(btn => {
+      btn.addEventListener('click', async () => {
+        const id = btn.dataset.id;
+        const email = btn.dataset.email;
+        const team = btn.dataset.team === 'gpt' ? 'gpt' : 'claude';
+        const teamLabel = team === 'gpt' ? 'ChatGPT Team' : 'Claude Team';
+        if(!confirm('Reopen ' + email + '\u2019s ' + teamLabel + ' checklist for editing? They will be able to change and resubmit just that team\u2019s checklist. This does not delete anything they already entered, and does not affect their other team\u2019s checklist.')) return;
+        btn.disabled = true;
+        try{
+          const colMap = await getColumnMap();
+          const statusDisplay = team === 'gpt' ? STATUS_GPT_DISPLAY : STATUS_CLAUDE_DISPLAY;
+          const statusCol = colMap[statusDisplay];
+          if(!statusCol) throw new Error('"' + statusDisplay + '" column not found — add it to the SharePoint list first');
+          const fields = {};
+          fields[statusCol] = 'Draft';
+          await graphFetch("/sites/" + siteId + "/lists/" + listId + "/items/" + id + "/fields", {
+            method: 'PATCH', body: JSON.stringify(fields)
+          });
+          if(String(myItemId) === String(id)){
+            lockedTeams[team] = false;
+          }
+          await openManageUsers();
+        }catch(err){
+          alert('Could not reopen: ' + err.message);
+          btn.disabled = false;
+        }
+      });
+    });
+    body.querySelectorAll('.manage-delete-btn').forEach(btn => {
+      btn.addEventListener('click', async () => {
+        const id = btn.dataset.id;
+        const email = btn.dataset.email;
+        if(!confirm('Permanently delete the saved submission for ' + email + '? This cannot be undone.')) return;
+        btn.disabled = true;
+        try{
+          await graphFetch("/sites/" + siteId + "/lists/" + listId + "/items/" + id, { method: 'DELETE' });
+          if(String(myItemId) === String(id)) myItemId = null;
+          await setupAdminControls();
+          await openManageUsers();
+        }catch(err){
+          alert('Could not delete: ' + err.message);
+          btn.disabled = false;
+        }
+      });
+    });
+  }catch(err){
+    body.innerHTML = '<tr><td colspan="5" style="color:#8a2d1f;">Failed to load: ' + err.message + '</td></tr>';
+    console.error(err);
+  }
+}
+document.getElementById('manage-users-btn').addEventListener('click', openManageUsers);
+document.getElementById('manage-close-btn').addEventListener('click', () => {
+  document.getElementById('manage-overlay').style.display = 'none';
 });
+async function persistForm(submitTeam){
+  const email = currentAccount.username;
+  const colMap = await getColumnMap();
+  const fields = { Title: email };
+  const missing = [];
+  const setIfMapped = (display, value) => {
+    const internal = colMap[display];
+    if(!internal){ missing.push(display); return; }
+    fields[internal] = value;
+  };
+  setIfMapped('Email', email);
+  setIfMapped('LastSavedDate', new Date().toISOString());
+  if(submitTeam === 'claude') setIfMapped(STATUS_CLAUDE_DISPLAY, 'Submitted');
+  if(submitTeam === 'gpt') setIfMapped(STATUS_GPT_DISPLAY, 'Submitted');
+  SECTIONS.forEach(section => {
+    const sectionData = {};
+    FIELD_DEFS.filter(d => d.section === section).forEach(def => {
+      sectionData[fieldDefKey(def)] = getFieldValue(def);
+    });
+    setIfMapped(section, JSON.stringify(sectionData));
+  });
+  if(missing.length) console.warn('SharePoint columns not found (skipped):', missing);
+
+  if(myItemId){
+    await graphFetch("/sites/" + siteId + "/lists/" + listId + "/items/" + myItemId + "/fields", {
+      method: 'PATCH', body: JSON.stringify(fields)
+    });
+  }else{
+    const created = await graphFetch("/sites/" + siteId + "/lists/" + listId + "/items", {
+      method: 'POST', body: JSON.stringify({ fields })
+    });
+    myItemId = created.id;
+  }
+  return missing;
+}
 async function saveDraft(){
+  if(lockedTeams.claude && lockedTeams.gpt) return; // safety net — button is hidden once both submitted, but guard anyway
   const btn = document.getElementById('save-btn');
   const statusEl = document.getElementById('draft-status');
   btn.disabled = true;
   const originalLabel = btn.textContent;
   btn.textContent = 'Saving...';
   try{
-    const email = currentAccount.username;
-    const colMap = await getColumnMap();
-    const fields = { Title: email };
-    const missing = [];
-    const setIfMapped = (display, value) => {
-      const internal = colMap[display];
-      if(!internal){ missing.push(display); return; }
-      fields[internal] = value;
-    };
-    setIfMapped('Email', email);
-    setIfMapped('Status', 'Draft');
-    setIfMapped('LastSavedDate', new Date().toISOString());
-    SECTIONS.forEach(section => {
-      const sectionData = {};
-      FIELD_DEFS.filter(d => d.section === section).forEach(def => {
-        sectionData[fieldDefKey(def)] = getFieldValue(def);
-      });
-      setIfMapped(section, JSON.stringify(sectionData));
-    });
-    if(missing.length) console.warn('SharePoint columns not found (skipped):', missing);
-
-    if(myItemId){
-      await graphFetch("/sites/" + siteId + "/lists/" + listId + "/items/" + myItemId + "/fields", {
-        method: 'PATCH', body: JSON.stringify(fields)
-      });
-    }else{
-      const created = await graphFetch("/sites/" + siteId + "/lists/" + listId + "/items", {
-        method: 'POST', body: JSON.stringify({ fields })
-      });
-      myItemId = created.id;
-    }
-    statusEl.textContent = missing.length ? ' · saved (missing SharePoint column: ' + missing.join(', ') + ')' : ' · saved';
+    const missing = await persistForm(null);
+    statusEl.textContent = missing.length ? ' · saved (missing SharePoint column: ' + missing.join(', ') + ')' : ' · draft saved';
   }catch(err){
     statusEl.textContent = ' · save failed — ' + err.message;
     console.error(err);
   }finally{
+    btn.disabled = false;
+    btn.textContent = originalLabel;
+  }
+}
+async function submitForReview(){
+  const team = currentTeamKey(); // 'claude' or 'gpt' — whichever team toggle is active
+  const teamLabel = team === 'gpt' ? 'ChatGPT Team' : 'Claude Team';
+  if(lockedTeams[team]){
+    alert('Your ' + teamLabel + ' checklist has already been sent for review and cannot be sent again.');
+    return;
+  }
+  if(!confirm('Send your ' + teamLabel + ' checklist for review? Once submitted, the ' + teamLabel + ' section will be locked and you won\u2019t be able to make further changes to it. You can only do this once per team. (Your other team\u2019s checklist is separate and won\u2019t be affected.)')) return;
+  const btn = document.getElementById('submit-btn');
+  const statusEl = document.getElementById('draft-status');
+  btn.disabled = true;
+  const originalLabel = btn.textContent;
+  btn.textContent = 'Submitting...';
+  try{
+    const missing = await persistForm(team);
+    lockedTeams[team] = true;
+    setTeamInteractive(team, false);
+    updateReadonlyBannerForSelf();
+    statusEl.textContent = missing.length
+      ? ' · ' + teamLabel + ' submitted (missing SharePoint column: ' + missing.join(', ') + ')'
+      : ' · ' + teamLabel + ' submitted for review';
+  }catch(err){
+    statusEl.textContent = ' · submit failed — ' + err.message;
+    console.error(err);
     btn.disabled = false;
     btn.textContent = originalLabel;
   }
