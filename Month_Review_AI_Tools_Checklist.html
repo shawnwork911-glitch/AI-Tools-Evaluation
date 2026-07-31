@@ -284,7 +284,7 @@
       <h2>Manage users</h2>
       <button type="button" id="manage-close-btn">Close</button>
     </div>
-    <p id="manage-hint">Everyone who has saved a checklist. View loads their form read-only; Reopen unlocks a submitted checklist so that person can edit and resubmit it; Delete permanently removes their saved entry.</p>
+    <p id="manage-hint">Everyone who has saved a checklist. Each person has up to two SharePoint rows — one for Claude Team, one for ChatGPT Team. View loads both read-only; Reopen unlocks just one submitted team's row so that person can edit and resubmit it; Delete permanently removes both of their rows.</p>
     <table id="manage-table">
       <thead>
         <tr><th>Email</th><th>Claude Team</th><th>ChatGPT Team</th><th>Last saved</th><th></th></tr>
@@ -571,12 +571,18 @@ const SP_LIST_NAME = "AI Tools Evaluation Report";            // must match the 
 const GRAPH_SCOPES = ["Sites.ReadWrite.All", "User.Read"];
 const ADMIN_EMAIL = "shauyuan.tan@saxonrenewables.com";      // hardcoded admin — can view every user's saved form
 
-/* Two independent status columns so submitting one team's checklist
-   never locks the other team's. Add these as two new Single-line-text
-   columns on the SharePoint list (the old shared "Status" column is no
-   longer used and can be left as-is or removed). */
-const STATUS_CLAUDE_DISPLAY = 'Status (Claude Team)';
-const STATUS_GPT_DISPLAY = 'Status (ChatGPT Team)';
+/* Each person gets up to TWO rows in the SharePoint list — one for their
+   Claude Team submission, one for their ChatGPT Team submission — instead
+   of one row holding both teams' data. This needs a "Team" column on the
+   list (Single line of text, values exactly "Claude Team" / "ChatGPT Team")
+   and a single "Status" column (Single line of text, values "Draft" /
+   "Submitted") that applies to whichever row it's on. If you're upgrading
+   from the old one-row-per-person version, the old "Status (Claude Team)"
+   and "Status (ChatGPT Team)" columns are no longer used and can be removed. */
+const TEAM_DISPLAY = 'Team';
+const TEAM_CLAUDE_VALUE = 'Claude Team';
+const TEAM_GPT_VALUE = 'ChatGPT Team';
+const STATUS_DISPLAY = 'Status';
 
 function isAdmin(){
   return !!(currentAccount && currentAccount.username &&
@@ -595,7 +601,8 @@ const msalInstance = new msal.PublicClientApplication({
 let currentAccount = null;
 let siteId = null;
 let listId = null;
-let myItemId = null;        // this user's existing SharePoint list item id, or null if no draft saved yet
+let myItemIds = { claude: null, gpt: null }; // this user's existing SharePoint row id for each team, or null if not saved yet
+let adminUsersCache = [];   // admin: last fetchAllItems() result, so the manage-users modal & dropdown can look up a user's two row ids by email
 let lockedTeams = { claude: false, gpt: false }; // each team locks independently once that team's checklist is submitted
 let suppressAutosave = false;
 const msalReady = msalInstance.initialize();   // MSAL v3 requires this to complete before any other MSAL call
@@ -696,6 +703,21 @@ const TEAM_FIELD_IDS = {
     ...monthItems.map((_, ii) => 'mG' + ii)
   ]
 };
+/* Which fields get WRITTEN into each team's SharePoint row. This is
+   TEAM_FIELD_IDS (the fields that lock on submit) plus the shared
+   "current test" scratch fields (testGoal/testPrompt), which aren't
+   locked but do need to be saved into both rows so each row is a
+   complete, self-contained record. */
+const TEAM_SAVE_FIELD_IDS = {
+  claude: [...TEAM_FIELD_IDS.claude, 'testGoal', 'testPrompt'],
+  gpt: [...TEAM_FIELD_IDS.gpt, 'testGoal', 'testPrompt']
+};
+function fieldBelongsToTeam(def, team){
+  if(def.kind === 'rating'){
+    return (team === 'claude' && def.team === 'c') || (team === 'gpt' && def.team === 'g');
+  }
+  return TEAM_SAVE_FIELD_IDS[team].includes(def.id);
+}
 function statusValue(existing, display){
   const internal = columnMapCache && columnMapCache[display];
   return internal ? existing.fields[internal] : undefined;
@@ -726,13 +748,22 @@ function setFieldValue(def, value){
 }
 function fieldDefKey(def){ return def.key || def.id; }
 
-/* ---- Each user has exactly one row, keyed by their email ---- */
-async function findMyItem(email){
+/* ---- Each user has up to TWO rows, keyed by email + Team ---- */
+async function findMyItems(email){
   const data = await graphFetch(
     "/sites/" + siteId + "/lists/" + listId + "/items?expand=fields&$filter=fields/Email eq '" + email + "'",
     { headers: { 'Prefer': 'HonorNonIndexedQueriesWarningMayFailRandomly' } }
   );
-  return (data.value || [])[0] || null;
+  const colMap = columnMapCache || {};
+  const teamCol = colMap[TEAM_DISPLAY];
+  const result = { claude: null, gpt: null };
+  (data.value || []).forEach(item => {
+    const teamVal = teamCol ? item.fields[teamCol] : null;
+    if(teamVal === TEAM_CLAUDE_VALUE) result.claude = item;
+    else if(teamVal === TEAM_GPT_VALUE) result.gpt = item;
+    else if(!result.claude) result.claude = item; // legacy row with no Team value yet — treat as Claude Team so nothing is lost
+  });
+  return result;
 }
 function applyItemToForm(existing){
   suppressAutosave = true;
@@ -815,8 +846,10 @@ function showLockedBanner(message){
 }
 async function loadMyDraft(){
   const email = currentAccount.username;
-  const existing = await findMyItem(email);
-  if(!existing){
+  await getColumnMap();
+  const items = await findMyItems(email);
+  myItemIds = { claude: items.claude ? items.claude.id : null, gpt: items.gpt ? items.gpt.id : null };
+  if(!items.claude && !items.gpt){
     lockedTeams = { claude: false, gpt: false };
     readOnlyMode = false;
     document.body.classList.remove('readonly-view');
@@ -826,12 +859,11 @@ async function loadMyDraft(){
     document.getElementById('draft-status').textContent = ' · no draft yet';
     return;
   }
-  myItemId = existing.id;
-  await getColumnMap();
-  applyItemToForm(existing);
+  if(items.claude) applyItemToForm(items.claude);
+  if(items.gpt) applyItemToForm(items.gpt);
   readOnlyMode = false;
-  lockedTeams.claude = statusValue(existing, STATUS_CLAUDE_DISPLAY) === 'Submitted';
-  lockedTeams.gpt = statusValue(existing, STATUS_GPT_DISPLAY) === 'Submitted';
+  lockedTeams.claude = items.claude ? statusValue(items.claude, STATUS_DISPLAY) === 'Submitted' : false;
+  lockedTeams.gpt = items.gpt ? statusValue(items.gpt, STATUS_DISPLAY) === 'Submitted' : false;
   setFormInteractive(true);
   setTeamInteractive('claude', !lockedTeams.claude);
   setTeamInteractive('gpt', !lockedTeams.gpt);
@@ -846,24 +878,32 @@ async function loadMyDraft(){
 async function fetchAllItems(){
   const colMap = await getColumnMap();
   const emailCol = colMap['Email'];
-  const claudeStatusCol = colMap[STATUS_CLAUDE_DISPLAY];
-  const gptStatusCol = colMap[STATUS_GPT_DISPLAY];
+  const teamCol = colMap[TEAM_DISPLAY];
+  const statusCol = colMap[STATUS_DISPLAY];
   const savedCol = colMap['LastSavedDate'];
   const selectCols = ['Title'];
   if(emailCol) selectCols.push(emailCol);
-  if(claudeStatusCol) selectCols.push(claudeStatusCol);
-  if(gptStatusCol) selectCols.push(gptStatusCol);
+  if(teamCol) selectCols.push(teamCol);
+  if(statusCol) selectCols.push(statusCol);
   if(savedCol) selectCols.push(savedCol);
   const data = await graphFetch(
     "/sites/" + siteId + "/lists/" + listId + "/items?$expand=fields($select=" + selectCols.join(',') + ")&$top=999"
   );
-  return (data.value || []).map(item => ({
-    id: item.id,
-    email: (emailCol && item.fields[emailCol]) || item.fields.Title || '(unknown)',
-    claudeStatus: (claudeStatusCol && item.fields[claudeStatusCol]) || 'Draft',
-    gptStatus: (gptStatusCol && item.fields[gptStatusCol]) || 'Draft',
-    lastSaved: savedCol ? item.fields[savedCol] : ''
-  }));
+  const byEmail = {};
+  (data.value || []).forEach(item => {
+    const email = (emailCol && item.fields[emailCol]) || item.fields.Title || '(unknown)';
+    const teamVal = teamCol ? item.fields[teamCol] : null;
+    const status = (statusCol && item.fields[statusCol]) || 'Draft';
+    const saved = savedCol ? (item.fields[savedCol] || '') : '';
+    if(!byEmail[email]){
+      byEmail[email] = { email, claudeId: null, gptId: null, claudeStatus: 'Draft', gptStatus: 'Draft', lastSaved: '' };
+    }
+    const rec = byEmail[email];
+    if(teamVal === TEAM_GPT_VALUE){ rec.gptId = item.id; rec.gptStatus = status; }
+    else { rec.claudeId = item.id; rec.claudeStatus = status; } // legacy/no-Team rows fall back to Claude
+    if(saved && saved > rec.lastSaved) rec.lastSaved = saved;
+  });
+  return Object.values(byEmail);
 }
 async function setupAdminControls(){
   const wrapEl = document.getElementById('admin-controls');
@@ -872,12 +912,13 @@ async function setupAdminControls(){
   select.innerHTML = '<option value="__self__">My form (' + currentAccount.username + ')</option>';
   try{
     const items = await fetchAllItems();
+    adminUsersCache = items;
     items
       .filter(it => it.email && it.email.toLowerCase() !== currentAccount.username.toLowerCase())
       .sort((a, b) => a.email.localeCompare(b.email))
       .forEach(it => {
         const opt = document.createElement('option');
-        opt.value = it.id;
+        opt.value = it.email;
         opt.textContent = it.email + ' — Claude: ' + it.claudeStatus + ' · ChatGPT: ' + it.gptStatus;
         select.appendChild(opt);
       });
@@ -903,10 +944,10 @@ async function goToMyForm(){
   if(sel) sel.value = '__self__';
   clearFormFields();
   setFormInteractive(true);
-  myItemId = null;
+  myItemIds = { claude: null, gpt: null };
   await loadMyDraft();
 }
-async function loadOtherUserItem(itemId){
+async function loadOtherUserByEmail(email){
   readOnlyMode = true;
   lockedTeams = { claude: false, gpt: false }; // viewing someone else's data — not this account's own lock state
   document.body.classList.add('readonly-view');
@@ -914,15 +955,22 @@ async function loadOtherUserItem(itemId){
   setFormInteractive(false);
   showReadonlyBanner('Loading…');
   try{
-    const existing = await graphFetch("/sites/" + siteId + "/lists/" + listId + "/items/" + itemId + "?expand=fields");
     await getColumnMap();
-    applyItemToForm(existing);
-    const colMap = columnMapCache || {};
-    const emailCol = colMap['Email'];
-    const emailVal = (emailCol && existing.fields[emailCol]) || existing.fields.Title || 'this user';
-    const cSub = statusValue(existing, STATUS_CLAUDE_DISPLAY) === 'Submitted';
-    const gSub = statusValue(existing, STATUS_GPT_DISPLAY) === 'Submitted';
-    showReadonlyBanner('Viewing ' + emailVal + '\u2019s submission — read-only. (Claude Team: ' + (cSub ? 'submitted' : 'draft') + ' · ChatGPT Team: ' + (gSub ? 'submitted' : 'draft') + ')');
+    let rec = adminUsersCache.find(u => u.email === email);
+    if(!rec){ // cache miss (e.g. deep link) — refetch
+      const items = await fetchAllItems();
+      adminUsersCache = items;
+      rec = items.find(u => u.email === email);
+    }
+    if(!rec) throw new Error('No saved rows found for ' + email);
+    const fetches = [];
+    if(rec.claudeId) fetches.push(graphFetch("/sites/" + siteId + "/lists/" + listId + "/items/" + rec.claudeId + "?expand=fields"));
+    if(rec.gptId) fetches.push(graphFetch("/sites/" + siteId + "/lists/" + listId + "/items/" + rec.gptId + "?expand=fields"));
+    const results = await Promise.all(fetches);
+    results.forEach(existing => applyItemToForm(existing));
+    const cSub = rec.claudeStatus === 'Submitted';
+    const gSub = rec.gptStatus === 'Submitted';
+    showReadonlyBanner('Viewing ' + email + '\u2019s submission — read-only. (Claude Team: ' + (cSub ? 'submitted' : 'draft') + ' · ChatGPT Team: ' + (gSub ? 'submitted' : 'draft') + ')');
   }catch(err){
     showReadonlyBanner('Could not load that submission — ' + err.message);
     console.error(err);
@@ -934,7 +982,7 @@ document.getElementById('admin-user-select').addEventListener('change', async (e
     await goToMyForm();
     return;
   }
-  await loadOtherUserItem(val);
+  await loadOtherUserByEmail(val);
 });
 
 /* ---- Preview: any signed-in user can view their own last-saved (server) copy, read-only ---- */
@@ -946,15 +994,16 @@ async function previewMyForm(){
   setFormInteractive(false);
   try{
     const email = currentAccount.username;
-    const existing = await findMyItem(email);
-    if(!existing){
+    await getColumnMap();
+    const items = await findMyItems(email);
+    if(!items.claude && !items.gpt){
       showReadonlyBanner('You haven\u2019t saved a form yet — nothing to preview.');
       return;
     }
-    await getColumnMap();
-    applyItemToForm(existing);
-    const cSub = statusValue(existing, STATUS_CLAUDE_DISPLAY) === 'Submitted';
-    const gSub = statusValue(existing, STATUS_GPT_DISPLAY) === 'Submitted';
+    if(items.claude) applyItemToForm(items.claude);
+    if(items.gpt) applyItemToForm(items.gpt);
+    const cSub = items.claude && statusValue(items.claude, STATUS_DISPLAY) === 'Submitted';
+    const gSub = items.gpt && statusValue(items.gpt, STATUS_DISPLAY) === 'Submitted';
     showReadonlyBanner('Previewing your last saved submission (Claude Team: ' + (cSub ? 'submitted' : 'draft') + ' · ChatGPT Team: ' + (gSub ? 'submitted' : 'draft') + ') — read-only.');
   }catch(err){
     showReadonlyBanner('Could not load your saved submission — ' + err.message);
@@ -970,6 +1019,7 @@ async function openManageUsers(){
   body.innerHTML = '<tr><td colspan="5" style="color:var(--sub);">Loading…</td></tr>';
   try{
     const items = await fetchAllItems();
+    adminUsersCache = items;
     if(!items.length){
       body.innerHTML = '<tr><td colspan="5" style="color:var(--sub);">No saved submissions yet.</td></tr>';
       return;
@@ -979,17 +1029,17 @@ async function openManageUsers(){
       const savedLabel = it.lastSaved ? new Date(it.lastSaved).toLocaleString() : '—';
       const tr = document.createElement('tr');
       const reopenBtns =
-        (it.claudeStatus === 'Submitted' ? '<button type="button" class="manage-reopen-btn" data-id="' + it.id + '" data-email="' + it.email + '" data-team="claude">Reopen Claude</button>' : '') +
-        (it.gptStatus === 'Submitted' ? '<button type="button" class="manage-reopen-btn" data-id="' + it.id + '" data-email="' + it.email + '" data-team="gpt">Reopen ChatGPT</button>' : '');
+        (it.claudeStatus === 'Submitted' ? '<button type="button" class="manage-reopen-btn" data-id="' + it.claudeId + '" data-email="' + it.email + '" data-team="claude">Reopen Claude</button>' : '') +
+        (it.gptStatus === 'Submitted' ? '<button type="button" class="manage-reopen-btn" data-id="' + it.gptId + '" data-email="' + it.email + '" data-team="gpt">Reopen ChatGPT</button>' : '');
       tr.innerHTML =
         '<td>' + it.email + '</td>' +
         '<td>' + it.claudeStatus + '</td>' +
         '<td>' + it.gptStatus + '</td>' +
         '<td>' + savedLabel + '</td>' +
         '<td style="text-align:right; white-space:nowrap;">' +
-          '<button type="button" class="manage-view-btn" data-id="' + it.id + '">View</button>' +
+          '<button type="button" class="manage-view-btn" data-email="' + it.email + '">View</button>' +
           reopenBtns +
-          '<button type="button" class="manage-delete-btn" data-id="' + it.id + '" data-email="' + it.email + '">Delete</button>' +
+          '<button type="button" class="manage-delete-btn" data-email="' + it.email + '" data-claude-id="' + (it.claudeId || '') + '" data-gpt-id="' + (it.gptId || '') + '">Delete</button>' +
         '</td>';
       body.appendChild(tr);
     });
@@ -997,8 +1047,8 @@ async function openManageUsers(){
       btn.addEventListener('click', async () => {
         overlay.style.display = 'none';
         const select = document.getElementById('admin-user-select');
-        if(select) select.value = btn.dataset.id;
-        await loadOtherUserItem(btn.dataset.id);
+        if(select) select.value = btn.dataset.email;
+        await loadOtherUserByEmail(btn.dataset.email);
       });
     });
     body.querySelectorAll('.manage-reopen-btn').forEach(btn => {
@@ -1007,19 +1057,19 @@ async function openManageUsers(){
         const email = btn.dataset.email;
         const team = btn.dataset.team === 'gpt' ? 'gpt' : 'claude';
         const teamLabel = team === 'gpt' ? 'ChatGPT Team' : 'Claude Team';
+        if(!id || id === 'null'){ alert('Could not find that row.'); return; }
         if(!confirm('Reopen ' + email + '\u2019s ' + teamLabel + ' checklist for editing? They will be able to change and resubmit just that team\u2019s checklist. This does not delete anything they already entered, and does not affect their other team\u2019s checklist.')) return;
         btn.disabled = true;
         try{
           const colMap = await getColumnMap();
-          const statusDisplay = team === 'gpt' ? STATUS_GPT_DISPLAY : STATUS_CLAUDE_DISPLAY;
-          const statusCol = colMap[statusDisplay];
-          if(!statusCol) throw new Error('"' + statusDisplay + '" column not found — add it to the SharePoint list first');
+          const statusCol = colMap[STATUS_DISPLAY];
+          if(!statusCol) throw new Error('"' + STATUS_DISPLAY + '" column not found — add it to the SharePoint list first');
           const fields = {};
           fields[statusCol] = 'Draft';
           await graphFetch("/sites/" + siteId + "/lists/" + listId + "/items/" + id + "/fields", {
             method: 'PATCH', body: JSON.stringify(fields)
           });
-          if(String(myItemId) === String(id)){
+          if(String(myItemIds[team]) === String(id)){
             lockedTeams[team] = false;
           }
           await openManageUsers();
@@ -1031,13 +1081,18 @@ async function openManageUsers(){
     });
     body.querySelectorAll('.manage-delete-btn').forEach(btn => {
       btn.addEventListener('click', async () => {
-        const id = btn.dataset.id;
         const email = btn.dataset.email;
-        if(!confirm('Permanently delete the saved submission for ' + email + '? This cannot be undone.')) return;
+        const claudeId = btn.dataset.claudeId;
+        const gptId = btn.dataset.gptId;
+        if(!confirm('Permanently delete the saved submission(s) for ' + email + '? This removes both the Claude Team row and the ChatGPT Team row (whichever exist) and cannot be undone.')) return;
         btn.disabled = true;
         try{
-          await graphFetch("/sites/" + siteId + "/lists/" + listId + "/items/" + id, { method: 'DELETE' });
-          if(String(myItemId) === String(id)) myItemId = null;
+          if(claudeId) await graphFetch("/sites/" + siteId + "/lists/" + listId + "/items/" + claudeId, { method: 'DELETE' });
+          if(gptId) await graphFetch("/sites/" + siteId + "/lists/" + listId + "/items/" + gptId, { method: 'DELETE' });
+          if(currentAccount && email.toLowerCase() === currentAccount.username.toLowerCase()){
+            if(claudeId) myItemIds.claude = null;
+            if(gptId) myItemIds.gpt = null;
+          }
           await setupAdminControls();
           await openManageUsers();
         }catch(err){
@@ -1055,10 +1110,16 @@ document.getElementById('manage-users-btn').addEventListener('click', openManage
 document.getElementById('manage-close-btn').addEventListener('click', () => {
   document.getElementById('manage-overlay').style.display = 'none';
 });
-async function persistForm(submitTeam){
+/* Writes ONE team's data into that team's own SharePoint row (creating it
+   the first time, updating it after that). Only fields belonging to that
+   team (per TEAM_SAVE_FIELD_IDS / fieldBelongsToTeam) are written, so the
+   Claude Team row never contains ChatGPT Team data and vice versa. */
+async function persistForm(team, submitting){
   const email = currentAccount.username;
+  const teamLabel = team === 'gpt' ? 'ChatGPT Team' : 'Claude Team';
+  const teamValue = team === 'gpt' ? TEAM_GPT_VALUE : TEAM_CLAUDE_VALUE;
   const colMap = await getColumnMap();
-  const fields = { Title: email };
+  const fields = { Title: email + ' — ' + teamLabel };
   const missing = [];
   const setIfMapped = (display, value) => {
     const internal = colMap[display];
@@ -1066,27 +1127,31 @@ async function persistForm(submitTeam){
     fields[internal] = value;
   };
   setIfMapped('Email', email);
+  setIfMapped(TEAM_DISPLAY, teamValue);
   setIfMapped('LastSavedDate', new Date().toISOString());
-  if(submitTeam === 'claude') setIfMapped(STATUS_CLAUDE_DISPLAY, 'Submitted');
-  if(submitTeam === 'gpt') setIfMapped(STATUS_GPT_DISPLAY, 'Submitted');
+  if(submitting){
+    setIfMapped(STATUS_DISPLAY, 'Submitted');
+  }else if(!myItemIds[team]){
+    setIfMapped(STATUS_DISPLAY, 'Draft'); // only set on first creation — don't downgrade an already-submitted row on a later autosave
+  }
   SECTIONS.forEach(section => {
     const sectionData = {};
-    FIELD_DEFS.filter(d => d.section === section).forEach(def => {
+    FIELD_DEFS.filter(d => d.section === section && fieldBelongsToTeam(d, team)).forEach(def => {
       sectionData[fieldDefKey(def)] = getFieldValue(def);
     });
     setIfMapped(section, JSON.stringify(sectionData));
   });
   if(missing.length) console.warn('SharePoint columns not found (skipped):', missing);
 
-  if(myItemId){
-    await graphFetch("/sites/" + siteId + "/lists/" + listId + "/items/" + myItemId + "/fields", {
+  if(myItemIds[team]){
+    await graphFetch("/sites/" + siteId + "/lists/" + listId + "/items/" + myItemIds[team] + "/fields", {
       method: 'PATCH', body: JSON.stringify(fields)
     });
   }else{
     const created = await graphFetch("/sites/" + siteId + "/lists/" + listId + "/items", {
       method: 'POST', body: JSON.stringify({ fields })
     });
-    myItemId = created.id;
+    myItemIds[team] = created.id;
   }
   return missing;
 }
@@ -1098,8 +1163,13 @@ async function saveDraft(){
   const originalLabel = btn.textContent;
   btn.textContent = 'Saving...';
   try{
-    const missing = await persistForm(null);
-    statusEl.textContent = missing.length ? ' · saved (missing SharePoint column: ' + missing.join(', ') + ')' : ' · draft saved';
+    const allMissing = [];
+    for(const team of ['claude', 'gpt']){
+      if(lockedTeams[team]) continue; // that row is already submitted & locked — leave it alone
+      const missing = await persistForm(team, false);
+      missing.forEach(m => { if(!allMissing.includes(m)) allMissing.push(m); });
+    }
+    statusEl.textContent = allMissing.length ? ' · saved (missing SharePoint column: ' + allMissing.join(', ') + ')' : ' · draft saved';
   }catch(err){
     statusEl.textContent = ' · save failed — ' + err.message;
     console.error(err);
@@ -1115,14 +1185,14 @@ async function submitForReview(){
     alert('Your ' + teamLabel + ' checklist has already been sent for review and cannot be sent again.');
     return;
   }
-  if(!confirm('Send your ' + teamLabel + ' checklist for review? Once submitted, the ' + teamLabel + ' section will be locked and you won\u2019t be able to make further changes to it. You can only do this once per team. (Your other team\u2019s checklist is separate and won\u2019t be affected.)')) return;
+  if(!confirm('Send your ' + teamLabel + ' checklist for review? Once submitted, the ' + teamLabel + ' row will be locked and you won\u2019t be able to make further changes to it. You can only do this once per team. (Your other team\u2019s checklist is a separate row and won\u2019t be affected — you can still switch to it and keep filling it in.)')) return;
   const btn = document.getElementById('submit-btn');
   const statusEl = document.getElementById('draft-status');
   btn.disabled = true;
   const originalLabel = btn.textContent;
   btn.textContent = 'Submitting...';
   try{
-    const missing = await persistForm(team);
+    const missing = await persistForm(team, true);
     lockedTeams[team] = true;
     setTeamInteractive(team, false);
     updateReadonlyBannerForSelf();
