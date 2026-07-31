@@ -209,6 +209,21 @@
   }
   #save-btn:disabled { opacity: .6; cursor: default; }
 
+  #admin-controls { align-items: center; gap: 8px; }
+  #admin-controls label { color: var(--sub); }
+  #admin-user-select { width: auto; min-width: 220px; }
+
+  #readonly-banner {
+    display: none; background: #eef2f7; border-left: 3px solid #4a6b8a;
+    padding: 12px 18px; margin-bottom: 24px;
+    font-family: "Helvetica Neue", Arial, sans-serif; font-size: 13.5px; color: #2c3e50;
+  }
+
+  body.readonly-view .dot-rating { cursor: default; }
+  body.readonly-view input:disabled,
+  body.readonly-view textarea:disabled,
+  body.readonly-view select:disabled { opacity: .75; cursor: default; }
+
   @media print {
     #login-overlay, #user-bar { display: none !important; }
   }
@@ -227,6 +242,10 @@
 
 <div id="user-bar">
   <span>Signed in as <strong id="user-email-label"></strong><span id="draft-status"></span></span>
+  <div id="admin-controls" style="display:none;">
+    <label for="admin-user-select">Viewing:</label>
+    <select id="admin-user-select" class="text-field"></select>
+  </div>
   <button type="button" id="signout-btn">Sign out</button>
 </div>
 
@@ -236,12 +255,14 @@
     <button class="team-btn gpt" id="btnGpt" onclick="selectTeam('chatgpt')">ChatGPT Team</button>
   </div>
   <div style="display:flex; gap:10px;">
-    <button class="reset-btn" onclick="resetAll()">Reset all entries</button>
+    <button class="reset-btn" id="reset-btn" onclick="resetAll()">Reset all entries</button>
     <button class="pdf-btn" id="save-btn" onclick="saveDraft()">Save</button>
   </div>
 </div>
 
 <div class="wrap">
+
+  <div id="readonly-banner"></div>
 
   <header class="title-block">
     <div class="eyebrow">Personal Use Review</div>
@@ -422,7 +443,10 @@
     g: Array(categories.length).fill(0)
   };
 
+  let readOnlyMode = false; // true while an admin is viewing another user's submission
+
   function setRating(team, index, value) {
+    if (readOnlyMode) return;
     ratings[team][index] = value;
     const container = document.querySelector(`.rating[data-team="${team}"][data-index="${index}"]`);
     const dots = container.querySelectorAll('.dot-rating');
@@ -453,8 +477,7 @@
     document.getElementById('btnGpt').classList.toggle('active', team === 'chatgpt');
   }
 
-  function resetAll() {
-    if (!confirm('Clear every checkbox, note, and score on this page?')) return;
+  function clearFormFields() {
     document.querySelectorAll('input[type="checkbox"]').forEach(cb => cb.checked = false);
     document.querySelectorAll('textarea.note').forEach(t => t.value = '');
     document.querySelectorAll('input.text-field').forEach(t => t.value = '');
@@ -462,11 +485,16 @@
     ratings.c.fill(0);
     ratings.g.fill(0);
     document.querySelectorAll('.dot-rating').forEach(dot => dot.classList.remove('active'));
-    
+
     // Clear out row marks back to 0/10
     document.querySelectorAll('.score-display').forEach(span => span.textContent = '0/10');
-    
+
     calcTotals();
+  }
+
+  function resetAll() {
+    if (!confirm('Clear every checkbox, note, and score on this page?')) return;
+    clearFormFields();
   }
 
   calcTotals();
@@ -482,6 +510,12 @@ const SP_HOSTNAME = "saxonrenewables.sharepoint.com";        // your SharePoint 
 const SP_SITE_PATH = "/sites/Operations";                    // the site the list lives on
 const SP_LIST_NAME = "AI Tools Evaluation Report";            // must match the SharePoint list's display name exactly
 const GRAPH_SCOPES = ["Sites.ReadWrite.All", "User.Read"];
+const ADMIN_EMAIL = "shauyuan.tan@saxonrenewables.com";      // hardcoded admin — can view every user's saved form
+
+function isAdmin(){
+  return !!(currentAccount && currentAccount.username &&
+    currentAccount.username.toLowerCase() === ADMIN_EMAIL.toLowerCase());
+}
 
 const msalInstance = new msal.PublicClientApplication({
   auth: {
@@ -611,13 +645,9 @@ async function findMyItem(email){
   );
   return (data.value || [])[0] || null;
 }
-async function loadMyDraft(){
-  const email = currentAccount.username;
-  const existing = await findMyItem(email);
-  if(!existing) return;
-  myItemId = existing.id;
+function applyItemToForm(existing){
   suppressAutosave = true;
-  const colMap = await getColumnMap();
+  const colMap = columnMapCache || {};
   SECTIONS.forEach(section => {
     const internal = colMap[section];
     if(!internal) return; // column not created yet — skip rather than fail the whole load
@@ -631,9 +661,96 @@ async function loadMyDraft(){
     });
   });
   suppressAutosave = false;
+}
+function setFormInteractive(enabled){
+  document.querySelectorAll('.wrap input, .wrap textarea, .wrap select').forEach(el => { el.disabled = !enabled; });
+  const saveBtn = document.getElementById('save-btn');
+  const resetBtn = document.getElementById('reset-btn');
+  if(saveBtn) saveBtn.style.display = enabled ? '' : 'none';
+  if(resetBtn) resetBtn.style.display = enabled ? '' : 'none';
+}
+async function loadMyDraft(){
+  const email = currentAccount.username;
+  const existing = await findMyItem(email);
+  if(!existing){
+    document.getElementById('draft-status').textContent = ' · no draft yet';
+    return;
+  }
+  myItemId = existing.id;
+  await getColumnMap();
+  applyItemToForm(existing);
   document.getElementById('draft-status').textContent =
     existing.fields.Status === 'Submitted' ? ' · submitted' : ' · draft loaded';
 }
+
+/* ---- Admin: list every user's saved row, and load a chosen one read-only ---- */
+async function fetchAllItems(){
+  const colMap = await getColumnMap();
+  const emailCol = colMap['Email'];
+  const statusCol = colMap['Status'];
+  const selectCols = ['Title'];
+  if(emailCol) selectCols.push(emailCol);
+  if(statusCol) selectCols.push(statusCol);
+  const data = await graphFetch(
+    "/sites/" + siteId + "/lists/" + listId + "/items?$expand=fields($select=" + selectCols.join(',') + ")&$top=999"
+  );
+  return (data.value || []).map(item => ({
+    id: item.id,
+    email: (emailCol && item.fields[emailCol]) || item.fields.Title || '(unknown)',
+    status: statusCol ? item.fields[statusCol] : ''
+  }));
+}
+async function setupAdminControls(){
+  const wrapEl = document.getElementById('admin-controls');
+  const select = document.getElementById('admin-user-select');
+  wrapEl.style.display = 'flex';
+  select.innerHTML = '<option value="__self__">My form (' + currentAccount.username + ')</option>';
+  try{
+    const items = await fetchAllItems();
+    items
+      .filter(it => it.email && it.email.toLowerCase() !== currentAccount.username.toLowerCase())
+      .sort((a, b) => a.email.localeCompare(b.email))
+      .forEach(it => {
+        const opt = document.createElement('option');
+        opt.value = it.id;
+        opt.textContent = it.email + (it.status ? ' — ' + it.status : '');
+        select.appendChild(opt);
+      });
+  }catch(err){
+    console.error('Admin: failed to list saved submissions:', err);
+  }
+}
+document.getElementById('admin-user-select').addEventListener('change', async (e) => {
+  const val = e.target.value;
+  const banner = document.getElementById('readonly-banner');
+  if(val === '__self__'){
+    readOnlyMode = false;
+    document.body.classList.remove('readonly-view');
+    banner.style.display = 'none';
+    clearFormFields();
+    setFormInteractive(true);
+    myItemId = null;
+    await loadMyDraft();
+    return;
+  }
+  readOnlyMode = true;
+  document.body.classList.add('readonly-view');
+  clearFormFields();
+  setFormInteractive(false);
+  banner.textContent = 'Loading…';
+  banner.style.display = 'block';
+  try{
+    const existing = await graphFetch("/sites/" + siteId + "/lists/" + listId + "/items/" + val + "?expand=fields");
+    applyItemToForm(existing);
+    const colMap = await getColumnMap();
+    const emailCol = colMap['Email'];
+    const emailVal = (emailCol && existing.fields[emailCol]) || existing.fields.Title || 'this user';
+    banner.textContent = 'Viewing ' + emailVal + '’s submission — read-only. Choose "My form" above to go back to editing your own.';
+  }catch(err){
+    banner.textContent = 'Could not load that submission — ' + err.message;
+    console.error(err);
+  }
+});
 async function saveDraft(){
   const btn = document.getElementById('save-btn');
   const statusEl = document.getElementById('draft-status');
@@ -672,7 +789,7 @@ async function saveDraft(){
       });
       myItemId = created.id;
     }
-    statusEl.textContent = missing.length ? ' · saved (' + missing.length + ' column(s) missing in SharePoint)' : ' · saved';
+    statusEl.textContent = missing.length ? ' · saved (missing SharePoint column: ' + missing.join(', ') + ')' : ' · saved';
   }catch(err){
     statusEl.textContent = ' · save failed — ' + err.message;
     console.error(err);
@@ -690,6 +807,9 @@ async function onSignedIn(){
   try{
     await resolveList();
     await loadMyDraft();
+    if(isAdmin()){
+      await setupAdminControls();
+    }
   }catch(err){
     document.getElementById('draft-status').textContent = ' · ' + err.message;
     console.error(err);
