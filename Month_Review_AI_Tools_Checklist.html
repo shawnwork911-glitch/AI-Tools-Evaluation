@@ -533,10 +533,81 @@ async function resolveList(){
   listId = lists.value[0].id;
 }
 
+/* ---- Field definitions, grouped into the 4 section columns ----
+   Each 'section' value must match a SharePoint column display name
+   exactly. All fields in the same section are compiled into one JSON
+   blob and written to that one column — so there are 4 data columns
+   total instead of one per question. */
+const SECTION_CHECKLIST = 'Monthly Checklist — Daily Life Use';
+const SECTION_PROMPT = 'Prompt Tester';
+const SECTION_AGENT = 'Build One Simple Agent';
+const SECTION_SCORECARD = 'Scorecard — 100 Points Total';
+
+const FIELD_DEFS = [
+  { id:'m0', section:SECTION_CHECKLIST, kind:'checkbox' },
+  { id:'m1', section:SECTION_CHECKLIST, kind:'checkbox' },
+  { id:'m2', section:SECTION_CHECKLIST, kind:'checkbox' },
+  { id:'m3', section:SECTION_CHECKLIST, kind:'checkbox' },
+  { id:'m4', section:SECTION_CHECKLIST, kind:'checkbox' },
+  { id:'m5', section:SECTION_CHECKLIST, kind:'checkbox' },
+  { id:'monthNote', section:SECTION_CHECKLIST, kind:'text' },
+  { id:'testGoal', section:SECTION_PROMPT, kind:'text' },
+  { id:'testPrompt', section:SECTION_PROMPT, kind:'text' },
+  { id:'claudeResponse', section:SECTION_PROMPT, kind:'text' },
+  { id:'claudeAchieved', section:SECTION_PROMPT, kind:'text' },
+  { id:'gptResponse', section:SECTION_PROMPT, kind:'text' },
+  { id:'gptAchieved', section:SECTION_PROMPT, kind:'text' },
+  { id:'agentTaskClaude', section:SECTION_AGENT, kind:'text' },
+  { id:'agentTimeClaude', section:SECTION_AGENT, kind:'text' },
+  { id:'agentSaveClaude', section:SECTION_AGENT, kind:'text' },
+  { id:'agentBabyClaude', section:SECTION_AGENT, kind:'text' },
+  { id:'agentBrokeClaude', section:SECTION_AGENT, kind:'text' },
+  { id:'agentTaskGpt', section:SECTION_AGENT, kind:'text' },
+  { id:'agentTimeGpt', section:SECTION_AGENT, kind:'text' },
+  { id:'agentSaveGpt', section:SECTION_AGENT, kind:'text' },
+  { id:'agentBabyGpt', section:SECTION_AGENT, kind:'text' },
+  { id:'agentBrokeGpt', section:SECTION_AGENT, kind:'text' }
+];
+const RATING_LABELS = [
+  'Speed', 'Accuracy', 'Context Memory', 'Non Work Ease', 'Writing Help',
+  'Research Help', 'Planning Help', 'Mobile Use', 'Value For Money', 'Overall Satisfaction'
+];
+RATING_LABELS.forEach((label, i) => {
+  FIELD_DEFS.push({ section:SECTION_SCORECARD, kind:'rating', team:'c', index:i, key:'c_' + i + '_' + label });
+  FIELD_DEFS.push({ section:SECTION_SCORECARD, kind:'rating', team:'g', index:i, key:'g_' + i + '_' + label });
+});
+const SECTIONS = [SECTION_CHECKLIST, SECTION_PROMPT, SECTION_AGENT, SECTION_SCORECARD];
+
+let columnMapCache = null;
+async function getColumnMap(){
+  if(columnMapCache) return columnMapCache;
+  const data = await graphFetch("/sites/" + siteId + "/lists/" + listId + "/columns?$select=name,displayName,hidden,readOnly");
+  const map = {};
+  (data.value || []).forEach(col => {
+    if(col.readOnly) return;
+    map[col.displayName] = col.name;
+  });
+  columnMapCache = map;
+  return map;
+}
+function getFieldValue(def){
+  if(def.kind === 'checkbox'){ const el = document.getElementById(def.id); return el ? el.checked : false; }
+  if(def.kind === 'text'){ const el = document.getElementById(def.id); return el ? el.value : ''; }
+  if(def.kind === 'rating'){ return ratings[def.team][def.index] || 0; }
+  return '';
+}
+function setFieldValue(def, value){
+  if(def.kind === 'checkbox'){ const el = document.getElementById(def.id); if(el) el.checked = !!value; return; }
+  if(def.kind === 'text'){ const el = document.getElementById(def.id); if(el) el.value = value || ''; return; }
+  if(def.kind === 'rating'){ const v = Number(value) || 0; if(v) setRating(def.team, def.index, v); return; }
+}
+function fieldDefKey(def){ return def.key || def.id; }
+
 /* ---- Each user has exactly one row, keyed by their email ---- */
 async function findMyItem(email){
   const data = await graphFetch(
-    "/sites/" + siteId + "/lists/" + listId + "/items?expand=fields&$filter=fields/Email eq '" + email + "'"
+    "/sites/" + siteId + "/lists/" + listId + "/items?expand=fields&$filter=fields/Email eq '" + email + "'",
+    { headers: { 'Prefer': 'HonorNonIndexedQueriesWarningMayFailRandomly' } }
   );
   return (data.value || [])[0] || null;
 }
@@ -545,9 +616,21 @@ async function loadMyDraft(){
   const existing = await findMyItem(email);
   if(!existing) return;
   myItemId = existing.id;
-  if(existing.fields.FormDataJSON){
-    applyFormState(JSON.parse(existing.fields.FormDataJSON));
-  }
+  suppressAutosave = true;
+  const colMap = await getColumnMap();
+  SECTIONS.forEach(section => {
+    const internal = colMap[section];
+    if(!internal) return; // column not created yet — skip rather than fail the whole load
+    const raw = existing.fields[internal];
+    if(!raw) return;
+    let data;
+    try{ data = JSON.parse(raw); }catch(e){ return; }
+    FIELD_DEFS.filter(d => d.section === section).forEach(def => {
+      const val = data[fieldDefKey(def)];
+      if(val !== undefined) setFieldValue(def, val);
+    });
+  });
+  suppressAutosave = false;
   document.getElementById('draft-status').textContent =
     existing.fields.Status === 'Submitted' ? ' · submitted' : ' · draft loaded';
 }
@@ -559,13 +642,26 @@ async function saveDraft(){
   btn.textContent = 'Saving...';
   try{
     const email = currentAccount.username;
-    const fields = {
-      Title: email,
-      Email: email,
-      Status: 'Draft',
-      FormDataJSON: JSON.stringify(collectFormState()),
-      LastSavedDate: new Date().toISOString()
+    const colMap = await getColumnMap();
+    const fields = { Title: email };
+    const missing = [];
+    const setIfMapped = (display, value) => {
+      const internal = colMap[display];
+      if(!internal){ missing.push(display); return; }
+      fields[internal] = value;
     };
+    setIfMapped('Email', email);
+    setIfMapped('Status', 'Draft');
+    setIfMapped('LastSavedDate', new Date().toISOString());
+    SECTIONS.forEach(section => {
+      const sectionData = {};
+      FIELD_DEFS.filter(d => d.section === section).forEach(def => {
+        sectionData[fieldDefKey(def)] = getFieldValue(def);
+      });
+      setIfMapped(section, JSON.stringify(sectionData));
+    });
+    if(missing.length) console.warn('SharePoint columns not found (skipped):', missing);
+
     if(myItemId){
       await graphFetch("/sites/" + siteId + "/lists/" + listId + "/items/" + myItemId + "/fields", {
         method: 'PATCH', body: JSON.stringify(fields)
@@ -576,7 +672,7 @@ async function saveDraft(){
       });
       myItemId = created.id;
     }
-    statusEl.textContent = ' · saved';
+    statusEl.textContent = missing.length ? ' · saved (' + missing.length + ' column(s) missing in SharePoint)' : ' · saved';
   }catch(err){
     statusEl.textContent = ' · save failed — ' + err.message;
     console.error(err);
@@ -584,33 +680,6 @@ async function saveDraft(){
     btn.disabled = false;
     btn.textContent = originalLabel;
   }
-}
-
-/* ---- Serialize / restore every input on the page ---- */
-function collectFormState(){
-  const state = { checkboxes:{}, notes:{}, textFields:{}, selects:{}, ratings:{ c: ratings.c, g: ratings.g }, mode: document.body.className };
-  document.querySelectorAll('ul.checklist input[type="checkbox"]').forEach(cb => state.checkboxes[cb.id] = cb.checked);
-  document.querySelectorAll('textarea.note').forEach(t => state.notes[t.id] = t.value);
-  document.querySelectorAll('input.text-field').forEach(t => state.textFields[t.id] = t.value);
-  document.querySelectorAll('select.text-field').forEach(s => state.selects[s.id] = s.value);
-  return state;
-}
-function applyFormState(state){
-  suppressAutosave = true;
-  Object.entries(state.checkboxes || {}).forEach(([id,val]) => { const el = document.getElementById(id); if(el) el.checked = val; });
-  Object.entries(state.notes || {}).forEach(([id,val]) => { const el = document.getElementById(id); if(el) el.value = val; });
-  Object.entries(state.textFields || {}).forEach(([id,val]) => { const el = document.getElementById(id); if(el) el.value = val; });
-  Object.entries(state.selects || {}).forEach(([id,val]) => { const el = document.getElementById(id); if(el) el.value = val; });
-  if(state.ratings){
-    (state.ratings.c || []).forEach((v,i) => { if(v) setRating('c', i, v); });
-    (state.ratings.g || []).forEach((v,i) => { if(v) setRating('g', i, v); });
-  }
-  if(state.mode){
-    document.body.className = state.mode;
-    document.getElementById('btnClaude').classList.toggle('active', state.mode === 'mode-claude');
-    document.getElementById('btnGpt').classList.toggle('active', state.mode === 'mode-chatgpt');
-  }
-  suppressAutosave = false;
 }
 
 /* ---- Sign-in wiring ---- */
